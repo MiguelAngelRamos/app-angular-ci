@@ -1,0 +1,100 @@
+# ════════════════════════════════════════════════════════════════════════════
+#  Dependabot — Actualización automática de dependencias
+#  ----------------------------------------------------------------------------
+#  Abre PRs automáticamente cuando hay nuevas versiones o vulnerabilidades en:
+#    1. Dependencias npm/pnpm (package.json)
+#    2. Imágenes base del Dockerfile (node, nginx)
+#    3. Versiones de acciones de GitHub (.github/workflows/*)
+#
+#  Buenas prácticas aplicadas:
+#    - Agrupa parches/minors para no inundar de PRs
+#    - Ignora majors automáticos (los reviewamos a mano)
+#    - Etiquetas y assignee para trazabilidad
+# ════════════════════════════════════════════════════════════════════════════
+version: 2
+
+updates:
+  # ── 1. npm / pnpm ─────────────────────────────────────────────────────────
+  - package-ecosystem: "npm"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "08:00"
+      timezone: "America/Santiago"
+    open-pull-requests-limit: 5
+    labels:
+      - "dependencies"
+      - "npm"
+    commit-message:
+      prefix: "deps"
+      include: "scope"
+    # Agrupa actualizaciones para evitar 30 PRs sueltos
+    groups:
+      angular:
+        patterns:
+          - "@angular/*"
+          - "@angular-*/*"
+        update-types:
+          - "minor"
+          - "patch"
+      dev-dependencies:
+        dependency-type: "development"
+        update-types:
+          - "minor"
+          - "patch"
+      production-minor-patch:
+        dependency-type: "production"
+        update-types:
+          - "minor"
+          - "patch"
+    # Los major los promovemos manualmente (Angular major = breaking)
+    ignore:
+      - dependency-name: "@angular/*"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "typescript"
+        update-types: ["version-update:semver-major"]
+
+  # ── 2. Imágenes base del Dockerfile ───────────────────────────────────────
+  # Dependabot reescribe el digest sha256 cuando hay nueva versión de
+  # node:22-alpine o nginx:1.27-alpine, manteniendo la inmutabilidad.
+  - package-ecosystem: "docker"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "08:00"
+      timezone: "America/Santiago"
+    open-pull-requests-limit: 3
+    labels:
+      - "dependencies"
+      - "docker"
+    commit-message:
+      prefix: "docker"
+    # Mantén major de node y nginx — un major implica revisión manual
+    ignore:
+      - dependency-name: "node"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "nginx"
+        update-types: ["version-update:semver-major"]
+
+  # ── 3. GitHub Actions del workflow ────────────────────────────────────────
+  # Mantiene actualizadas las versiones de actions/checkout, docker/*, etc.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "08:00"
+      timezone: "America/Santiago"
+    open-pull-requests-limit: 3
+    labels:
+      - "dependencies"
+      - "github-actions"
+    commit-message:
+      prefix: "ci"
+    groups:
+      actions-minor-patch:
+        update-types:
+          - "minor"
+          - "patch"

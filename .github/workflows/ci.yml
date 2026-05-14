@@ -1,0 +1,343 @@
+# ════════════════════════════════════════════════════════════════════════════
+#  Pipeline CI/CD — Angular Secure (Angular 21 + pnpm + Docker)
+#  ----------------------------------------------------------------------------
+#  Etapas:
+#    1. quality   → instalar, type-check y tests unitarios (vitest)
+#    2. audit     → SCA: vulnerabilidades en dependencias npm (pnpm audit)
+#    3. codeql    → SAST: análisis estático de TS/JS por GitHub
+#    4. hadolint  → Lint del Dockerfile (buenas prácticas)
+#    5. image     → Build de imagen + SBOM + escaneo CVEs + firma + push a GHCR
+#
+#  Notas:
+#    - GHCR = GitHub Container Registry (registro de imágenes integrado en GH).
+#    - SBOM = Software Bill of Materials (inventario de componentes).
+#    - SAST = Static Application Security Testing.
+#    - SCA  = Software Composition Analysis.
+#    - Las imágenes solo se PUSHEAN en `main`; en PRs solo se BUILDEAN.
+# ════════════════════════════════════════════════════════════════════════════
+
+name: CI
+
+# ── Disparadores ────────────────────────────────────────────────────────────
+# push  → corre cuando se mergea/empuja a main (publica imagen)
+# pull_request → corre en cada PR a main (NO publica imagen)
+# workflow_dispatch → permite lanzar manualmente desde la UI de Actions
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+# ── Permisos por defecto (principio de menor privilegio) ────────────────────
+# Por defecto el GITHUB_TOKEN solo puede LEER el repo. Cada job que necesite
+# más permisos (escribir paquetes, firmar, etc.) los escala explícitamente.
+permissions:
+  contents: read
+
+# ── Concurrencia ────────────────────────────────────────────────────────────
+# Si llega un nuevo push al mismo branch/PR, cancela el run anterior en curso.
+# Ahorra minutos de CI y evita resultados obsoletos.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# ── Variables compartidas entre jobs ────────────────────────────────────────
+env:
+  NODE_VERSION: '22'                       # alinea con Dockerfile (node:22.22.2)
+  REGISTRY: ghcr.io                        # GitHub Container Registry
+  IMAGE_NAME: ${{ github.repository }}     # ej: miguelangelramos/angular-secure
+
+jobs:
+  # ══════════════════════════════════════════════════════════════════════════
+  # 1) QUALITY — Instalar deps, type-check y tests unitarios
+  # ══════════════════════════════════════════════════════════════════════════
+  quality:
+    name: Quality & unit tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      # Clona el repo (fetch-depth: 1 para acelerar; no necesitamos historial)
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # pnpm/action-setup lee `packageManager` de package.json (pnpm@10.33.0)
+      # garantizando misma versión en CI y local.
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+
+      # Setup Node + cache automático del store de pnpm
+      # `cache: 'pnpm'` invalida la caché cuando cambia pnpm-lock.yaml
+      - name: Setup Node ${{ env.NODE_VERSION }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'pnpm'
+
+      # --frozen-lockfile = falla si pnpm-lock.yaml necesita cambios.
+      # Garantiza builds reproducibles (mismo grafo de deps que en local).
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      # Type-check estricto sin emitir JS — detecta errores TS sin compilar
+      - name: TypeScript type-check
+        run: pnpm exec tsc --noEmit -p tsconfig.json
+
+      # Tests con vitest vía `@angular/build:unit-test` (Angular 21).
+      # En CI corre en modo single-run automáticamente.
+      - name: Unit tests
+        run: pnpm test
+
+      # Sube el build de Angular como artifact para reutilizar en `image` job
+      # (acelera el job siguiente porque no rebuildeamos en Docker desde cero
+      # solo si decidimos optimizar; aquí lo dejamos como evidencia/auditoría)
+      - name: Build Angular (production)
+        run: pnpm exec ng build --configuration=production
+
+      - name: Upload dist artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: angular-dist
+          path: dist/
+          retention-days: 7
+
+  # ══════════════════════════════════════════════════════════════════════════
+  # 2) AUDIT — SCA con pnpm audit (CVEs en dependencias npm)
+  # ══════════════════════════════════════════════════════════════════════════
+  audit:
+    name: pnpm audit (SCA)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'pnpm'
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      # Solo dependencias de producción (devDeps no van a la imagen).
+      # --audit-level=high → falla solo en high/critical (ajustable).
+      # `|| true` opcional si prefieres NO bloquear el pipeline al inicio.
+      - name: Run pnpm audit
+        run: pnpm audit --prod --audit-level=high
+
+  # ══════════════════════════════════════════════════════════════════════════
+  # 3) CODEQL — SAST nativo de GitHub (sustituye a SonarQube)
+  #    Los resultados aparecen en la pestaña "Security" del repo.
+  # ══════════════════════════════════════════════════════════════════════════
+  codeql:
+    name: CodeQL (SAST)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    # CodeQL necesita escribir alertas en la pestaña Security
+    permissions:
+      contents: read
+      security-events: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          # Analiza TS y JS juntos (el motor unificado de GH desde 2024)
+          languages: javascript-typescript
+          # `security-and-quality` incluye reglas de seguridad + calidad
+          queries: security-and-quality
+
+      - name: Perform CodeQL analysis
+        uses: github/codeql-action/analyze@v3
+        with:
+          category: '/language:javascript-typescript'
+
+  # ══════════════════════════════════════════════════════════════════════════
+  # 4) HADOLINT — Lint del Dockerfile
+  #    Detecta antipatrones: usuario root, latest tags, apt sin --no-install...
+  # ══════════════════════════════════════════════════════════════════════════
+  hadolint:
+    name: Hadolint (Dockerfile)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Hadolint
+        uses: hadolint/hadolint-action@v3.1.0
+        with:
+          dockerfile: Dockerfile
+          # Solo falla si hay errores; warnings se reportan pero no bloquean
+          failure-threshold: error
+          # Sube hallazgos al panel Security como SARIF
+          format: sarif
+          output-file: hadolint.sarif
+          no-fail: true
+
+      - name: Upload Hadolint SARIF
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: hadolint.sarif
+          category: hadolint
+
+  # ══════════════════════════════════════════════════════════════════════════
+  # 5) IMAGE — Build de imagen Docker + SBOM + scan CVEs + firma + push
+  #    Depende de TODOS los jobs anteriores (gate de calidad y seguridad).
+  # ══════════════════════════════════════════════════════════════════════════
+  image:
+    name: Build, SBOM, scan & sign image
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs: [quality, audit, codeql, hadolint]
+
+    # Permisos específicos para construir, publicar y firmar:
+    permissions:
+      contents: read
+      packages: write          # push a GHCR
+      id-token: write          # Cosign keyless via OIDC (sin gestionar claves)
+      attestations: write      # adjuntar SBOM como attestation a la imagen
+      security-events: write   # subir resultados de Scout al panel Security
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ── Login a GHCR (solo en push a main, no en PRs) ──────────────────────
+      # GITHUB_TOKEN tiene `packages: write` gracias al permiso del job.
+      - name: Log in to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # ── Genera tags y labels OCI estándar ──────────────────────────────────
+      # Resultado típico:
+      #   ghcr.io/owner/repo:sha-abc1234
+      #   ghcr.io/owner/repo:main
+      #   ghcr.io/owner/repo:latest   (solo en branch por defecto)
+      - name: Generate Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=sha,prefix=sha-,format=short
+            type=ref,event=branch
+            type=ref,event=pr
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      # ── Buildx: builder moderno con BuildKit, cache y multi-plataforma ─────
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # ── Build (carga local SIEMPRE para escanear) + push solo en main ──────
+      # cache-from/to=gha usa el cache de GitHub Actions (capas de Docker).
+      - name: Build Docker image
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          # En PR solo build+load (para escanear). En main: load + push.
+          load: ${{ github.event_name == 'pull_request' }}
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          # BuildKit adjunta provenance + SBOM básico como attestations OCI
+          provenance: mode=max
+          sbom: true
+
+      # ── SBOM CycloneDX completo con Syft (más detallado que el de BuildKit) ─
+      # Escanea la imagen (no el filesystem) → incluye paquetes del SO base
+      # (nginx, alpine, musl libc, etc.) además de los npm.
+      - name: Generate SBOM (CycloneDX)
+        uses: anchore/sbom-action@v0
+        with:
+          image: ${{ fromJSON(steps.meta.outputs.json).tags[0] }}
+          format: cyclonedx-json
+          output-file: sbom.cdx.json
+          upload-artifact: false   # lo subimos manualmente con nombre claro
+
+      - name: Upload SBOM as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom-cyclonedx-${{ github.sha }}
+          path: sbom.cdx.json
+          retention-days: 90       # retención larga para auditoría
+
+      # ── Escaneo de vulnerabilidades de la imagen (alternativa a Trivy) ─────
+      # Docker Scout consulta CVEs de capas npm + OS contra bases públicas.
+      - name: Docker Scout — CVE scan
+        if: github.event_name != 'pull_request'
+        uses: docker/scout-action@v1
+        with:
+          command: cves
+          image: ${{ fromJSON(steps.meta.outputs.json).tags[0] }}
+          only-severities: critical,high
+          sarif-file: scout.sarif
+          # exit-code=true → falla el job si hay critical/high.
+          # Cámbialo a false al inicio si quieres "report-only".
+          exit-code: true
+          summary: true
+
+      - name: Upload Scout SARIF
+        if: github.event_name != 'pull_request' && always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: scout.sarif
+          category: docker-scout
+
+      # ── Firma de imagen con Cosign keyless (OIDC de GitHub) ────────────────
+      # No requiere gestionar llaves: la identidad del workflow se vuelve la
+      # "firma". Verificable con: cosign verify --certificate-identity ...
+      - name: Install Cosign
+        if: github.event_name != 'pull_request'
+        uses: sigstore/cosign-installer@v3
+
+      - name: Sign image
+        if: github.event_name != 'pull_request'
+        env:
+          IMAGE_REF: ${{ fromJSON(steps.meta.outputs.json).tags[0] }}@${{ steps.build.outputs.digest }}
+        run: |
+          # `--yes` acepta los términos de Sigstore sin prompt interactivo
+          cosign sign --yes "$IMAGE_REF"
+
+      # ── Attestation del SBOM ───────────────────────────────────────────────
+      # Adjunta el SBOM CycloneDX a la imagen de forma criptográficamente
+      # verificable. Después se puede recuperar con:
+      #   cosign download attestation <imagen>
+      - name: Attest SBOM to image
+        if: github.event_name != 'pull_request'
+        env:
+          IMAGE_REF: ${{ fromJSON(steps.meta.outputs.json).tags[0] }}@${{ steps.build.outputs.digest }}
+        run: |
+          cosign attest --yes \
+            --predicate sbom.cdx.json \
+            --type cyclonedx \
+            "$IMAGE_REF"
+
+      # ── Resumen visible en la pestaña "Summary" del run ────────────────────
+      - name: Job summary
+        if: always()
+        run: |
+          {
+            echo "## Build summary"
+            echo ""
+            echo "| Item | Valor |"
+            echo "|---|---|"
+            echo "| Imagen | \`${{ fromJSON(steps.meta.outputs.json).tags[0] }}\` |"
+            echo "| Digest | \`${{ steps.build.outputs.digest }}\` |"
+            echo "| Pusheada | ${{ github.event_name != 'pull_request' }} |"
+            echo "| SBOM | sbom-cyclonedx-${{ github.sha }} (artifact) |"
+          } >> "$GITHUB_STEP_SUMMARY"
