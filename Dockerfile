@@ -24,7 +24,7 @@ COPY --chown=node:node . .
 RUN pnpm run build --configuration=production
 
 ## Serve (servir archivos estáticos con un servidor web ligero)
-FROM nginx:1.27-alpine@sha256:0272e4604ed93c1792f03695a033a6e8546840f86e0de20a884bb17d2c924883 AS runner
+FROM nginx:1.31-alpine@sha256:f105e3f12187c58ddc3acd09bbe4b9e4a9ab1df855d3d0e511b641077b5e988e AS runner
 
 LABEL org.opencontainers.image.source="https://github.com/MiguelAngelRamos/angular-secure" \
       org.opencontainers.image.title="clinic-frontend" \
