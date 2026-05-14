@@ -226,6 +226,18 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # ── Login a Docker Hub (necesario para Docker Scout) ───────────────────
+      # Scout valida el "entitlement" contra Docker Hub. Sin este login falla
+      # con: "could not authenticate: user githubactions not entitled to use
+      # Docker Scout". No lleva `registry:` porque docker/login-action apunta
+      # a docker.io por defecto.
+      - name: Log in to Docker Hub
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
       # ── Genera tags y labels OCI estándar ──────────────────────────────────
       # Resultado típico:
       #   ghcr.io/owner/repo:sha-abc1234
