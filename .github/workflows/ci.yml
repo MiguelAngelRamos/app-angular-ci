@@ -177,7 +177,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Hadolint
-        uses: hadolint/hadolint-action@v3.1.0
+        uses: hadolint/hadolint-action@v3.3.0
         with:
           dockerfile: Dockerfile
           # Solo falla si hay errores; warnings se reportan pero no bloquean
