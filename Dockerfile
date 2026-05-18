@@ -1,7 +1,7 @@
 # PATRÓN MULTI-STAGE (varias etapas)
 # Etapa Build:
 # Node, pnpm y todo el código fuente para compilar la aplicación
-FROM node:22.22.2-alpine3.22@sha256:b77017c37f430e4466ff497058948a2f16e8b59779600d53711eeb7b999b0f4e AS builder
+FROM node:22.22.3-alpine3.22@sha256:cd7807368cf24826297cbad5dca1a44972ccfd770647db52a8c7589eb4599ac8 AS builder
 
 # Activar pnpm con versión específica (evita descarga dinámica)
 RUN corepack enable \
